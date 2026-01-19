@@ -1,0 +1,16 @@
+# Misc
+.env
+.DS_Store
+*.log
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+
+# Rust
+target/
+
+# Node
+node_modules/
+.next/
