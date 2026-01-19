@@ -1,0 +1,22 @@
+# Nashville Smart City OS MVP
+
+Proof-of-concept autonomous smart city monitoring system focused on Nashville, TN.  
+Designed as **nationwide-scalable** microservices architecture from day one.
+
+**Core Principle**: Right tool for the right job — demonstrating deliberate architecture choices.
+
+### Tech Stack & Responsibilities
+- **Go** (gateway): High-concurrency orchestrator, API gateway, WebSocket real-time updates, job queue
+- **Rust** (processor): Blazing-fast filtering, geospatial calculations, gatekeeping before expensive AI calls
+- **Python** (ai-agent): LLM agents (OpenAI/Claude), RAG pipelines, anomaly reasoning, Text-to-SQL
+- **TypeScript/Next.js** (frontend): Interactive Mapbox/Leaflet dashboard + natural language query interface
+
+### Architecture Overview
+```mermaid
+graph TD
+    A[Data Sources<br>Nashville Open Data / 511] -->|Poll / Webhook| B[Go Gateway]
+    B --> C[Rust Processor<br>Fast Filter + Geo]
+    C -->|Anomalies only| D[Python AI Agent<br>LLM Reasoning / RAG]
+    D -->|Structured Actions| B
+    B --> E[TypeScript Frontend<br>Live Map + Query UI]
+    B -.-> F[PostGIS DB<br>Geospatial Storage]

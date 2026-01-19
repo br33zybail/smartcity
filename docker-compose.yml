@@ -1,0 +1,36 @@
+version: '3.9'
+
+services:
+  gateway:
+    build: ./services/gateway
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+
+  processor:
+    build: ./services/processor
+
+  ai-agent:
+    build: ./services/ai-agent
+    env_file:
+      - .env
+
+  frontend:
+    build: ./services/frontend
+    ports:
+      - "3000:3000"
+
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: smartcity
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
