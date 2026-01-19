@@ -3,14 +3,81 @@
 .DS_Store
 *.log
 
-# Python
-__pycache__/
-.venv/
-*.pyc
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
 
-# Rust
+#Rust / Cargo
 target/
+debug/
+release/
 
-# Node
+# VS Code
+.vscode/
+
+# temp files
+.DS_Store
+*.swp
+.idea/
+.dtrace*
+.dtrace#
+*.log
+
+#Build artifacts
+*.out
+*.profraw
+
+#Python
+.venv/
+venv/
+ENV/
+env/
+*.pyc
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+dist/
+build/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+#Typescript
 node_modules/
-.next/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+.pnp/
+.pnp.js
+.yarn/*
+!.yarn/patches/
+!.yarn/plugins/
+!.yarn/releases/
+!.yarn/sdks/
+!.yarn/versions/
+ts-dashboard/*.js
+
+#Misc
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# Logs and temp files
+*.log
+tmp/
+temp/
