@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/br33zybail/smartcity/services/gateway/api"
 	"github.com/br33zybail/smartcity/services/gateway/sources"
+	"github.com/gin-gonic/gin"
 	"github.com/go-resty/resty/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -42,8 +46,9 @@ type Source struct {
 // ============== Global State ==============
 
 var (
-	dbPool *pgxpool.Pool
-	client *resty.Client
+	dbPool    *pgxpool.Pool
+	client    *resty.Client
+	apiServer *api.Server
 )
 
 // ============== Main ==============
@@ -76,21 +81,34 @@ func main() {
 	}
 	log.Println("Connected to PostGIS")
 
-	// Initialize HTTP client
+	// Initialize HTTP client for API calls
 	client = resty.New().
 		SetRetryCount(3).
 		SetRetryWaitTime(2 * time.Second).
 		SetTimeout(30 * time.Second)
 
+	// Initialize API server
+	redisAddr := os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	apiServer = api.NewServer(dbPool, redisAddr)
+	defer apiServer.Close()
+
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() { <-sigChan; cancel() }()
 
-	log.Printf("%s Data Ingester started", cfg.City)
-
-	// Start per-source goroutines
 	var wg sync.WaitGroup
+
+	// Start PostgreSQL LISTEN for real-time events
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		listenForEvents(ctx)
+	}()
+
+	// Start per-source ingester goroutines
 	for name, src := range cfg.Sources {
 		wg.Add(1)
 		go func(name string, src Source) {
@@ -99,8 +117,23 @@ func main() {
 		}(name, src)
 	}
 
+	// Start HTTP server
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runHTTPServer(ctx)
+	}()
+
+	log.Printf("%s Data Ingester + API Gateway started", cfg.City)
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Println("Shutdown signal received")
+	cancel()
+
+	// Wait for all goroutines to finish
 	wg.Wait()
-	log.Println("Shutting down")
+	log.Println("Shutdown complete")
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -113,6 +146,86 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// ============== HTTP Server ==============
+
+func runHTTPServer(ctx context.Context) {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		SkipPaths: []string{"/health"},
+	}))
+
+	// Setup routes
+	apiServer.SetupRoutes(r)
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: r,
+	}
+
+	// Start server in goroutine
+	go func() {
+		log.Println("HTTP server listening on :8080")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Wait for context cancellation
+	<-ctx.Done()
+
+	// Graceful shutdown with timeout
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	}
+	log.Println("HTTP server stopped")
+}
+
+// ============== PostgreSQL LISTEN ==============
+
+func listenForEvents(ctx context.Context) {
+	// Acquire a dedicated connection for LISTEN
+	conn, err := dbPool.Acquire(ctx)
+	if err != nil {
+		log.Printf("Failed to acquire connection for LISTEN: %v", err)
+		return
+	}
+	defer conn.Release()
+
+	_, err = conn.Exec(ctx, "LISTEN new_event")
+	if err != nil {
+		log.Printf("Failed to LISTEN: %v", err)
+		return
+	}
+
+	log.Println("Listening for new_event notifications")
+
+	for {
+		notification, err := conn.Conn().WaitForNotification(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return // Context cancelled, shutdown
+			}
+			log.Printf("LISTEN error: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Parse and broadcast the event
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(notification.Payload), &event); err != nil {
+			log.Printf("Failed to parse notification: %v", err)
+			continue
+		}
+
+		apiServer.BroadcastEvent(event)
+	}
 }
 
 // ============== Source Ingester ==============
@@ -144,7 +257,6 @@ func runSourceIngester(ctx context.Context, name string, src Source) {
 }
 
 func fetchAndStore(ctx context.Context, name string, src Source) {
-	// Fetch data from API
 	resp, err := client.R().
 		SetQueryParams(src.Params).
 		Get(src.URL)
@@ -158,7 +270,6 @@ func fetchAndStore(ctx context.Context, name string, src Source) {
 		return
 	}
 
-	// Parse based on source type
 	parser := getParser(name, src.Type)
 	events, err := parser.Parse(resp.Body())
 	if err != nil {
@@ -173,7 +284,6 @@ func fetchAndStore(ctx context.Context, name string, src Source) {
 
 	log.Printf("[%s] Fetched %d events", name, len(events))
 
-	// Batch insert into events table
 	inserted := batchInsertEvents(ctx, events, name)
 	log.Printf("[%s] Upserted %d events", name, inserted)
 }
@@ -181,7 +291,6 @@ func fetchAndStore(ctx context.Context, name string, src Source) {
 func getParser(name, sourceType string) sources.Parser {
 	switch sourceType {
 	case "arcgis":
-		// Map config name to source type for the parser
 		eventType := name
 		switch name {
 		case "accidents":

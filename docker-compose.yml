@@ -8,12 +8,15 @@ services:
       - .env
     environment:
       DATABASE_URL: postgres://postgres:devpassword@db:5432/smartcity
+      REDIS_URL: redis:6379
       CONFIG_PATH: /app/config/nashville.yaml
     volumes:
       - ./config/cities/nashville.yaml:/app/config/nashville.yaml:ro
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
 
   processor:
     build: ./services/processor
@@ -27,6 +30,14 @@ services:
     build: ./services/frontend
     ports:
       - "3000:3000"
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
 
   db:
     image: postgis/postgis:16-3.4
@@ -47,3 +58,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
