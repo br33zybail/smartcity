@@ -10,7 +10,7 @@ RUN go mod download
 
 COPY . .
 # Build static binary: disable CGO, linux target, strip debug info
-RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-w -s' -o ingester main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-w -s' -o ingester .
 
 # Runtime stage
 FROM alpine:latest
@@ -20,7 +20,8 @@ RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/ingester .
-# No .env COPY needed
+
+# Config will be mounted via docker-compose
 
 # Optional: tini for better signal handling (good habit)
 RUN apk add --no-cache tini

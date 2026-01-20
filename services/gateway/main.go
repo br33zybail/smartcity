@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -10,68 +9,34 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/br33zybail/smartcity/services/gateway/sources"
 	"github.com/go-resty/resty/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"gopkg.in/yaml.v3"
 )
 
-// ============== API Response Types ==============
+// ============== Config Types ==============
 
-type AccidentsResponse struct {
-	Features []AccidentFeature `json:"features"`
+type Config struct {
+	City     string            `yaml:"city"`
+	Timezone string            `yaml:"timezone"`
+	BBox     BBox              `yaml:"bbox"`
+	Sources  map[string]Source `yaml:"sources"`
 }
 
-type AccidentFeature struct {
-	Attributes AccidentAttributes `json:"attributes"`
-	Geometry   Geometry           `json:"geometry"`
+type BBox struct {
+	MinLat float64 `yaml:"min_lat"`
+	MinLon float64 `yaml:"min_lon"`
+	MaxLat float64 `yaml:"max_lat"`
+	MaxLon float64 `yaml:"max_lon"`
 }
 
-type AccidentAttributes struct {
-	AccidentNumber   float64 `json:"Accident_Number"`
-	DateTime         int64   `json:"Date_and_Time"`
-	CollisionType    *string `json:"Collision_Type_Description"`
-	WeatherCondition *string `json:"Weather_Description"`
-}
-
-type Geometry struct {
-	X float64 `json:"x"`
-	Y float64 `json:"y"`
-}
-
-type DispatchResponse struct {
-	Features []DispatchFeature `json:"features"`
-}
-
-type DispatchFeature struct {
-	Attributes DispatchAttributes `json:"attributes"`
-}
-
-type DispatchAttributes struct {
-	ObjectId            int64   `json:"ObjectId"`
-	IncidentTypeCode    *string `json:"IncidentTypeCode"`
-	IncidentTypeName    *string `json:"IncidentTypeName"`
-	CallReceivedTime    *int64  `json:"CallReceivedTime"`
-	Location            *string `json:"Location"`
-	LocationDescription *string `json:"LocationDescription"`
-	CityName            *string `json:"CityName"`
-	LastUpdated         *int64  `json:"LastUpdated"`
-}
-
-type FireResponse struct {
-	Features []FireFeature `json:"features"`
-}
-
-type FireFeature struct {
-	Attributes FireAttributes `json:"attributes"`
-}
-
-type FireAttributes struct {
-	ObjectId         int64   `json:"ObjectId"`
-	EventNumber      *string `json:"event_number"`
-	UnitID           *string `json:"Unit_ID"`
-	IncidentTypeID   *string `json:"incident_type_id"`
-	DispatchDateTime *int64  `json:"DispatchDateTime"`
-	PostalCode       *string `json:"PostalCode"`
+type Source struct {
+	URL      string            `yaml:"url"`
+	Type     string            `yaml:"type"`
+	Interval string            `yaml:"interval"`
+	Params   map[string]string `yaml:"params"`
 }
 
 // ============== Global State ==============
@@ -87,8 +52,19 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Load config
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "/app/config/nashville.yaml"
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+	log.Printf("Loaded config for city: %s", cfg.City)
+
 	// Initialize database pool
-	var err error
 	dbPool, err = pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v", err)
@@ -111,239 +87,152 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigChan; cancel() }()
 
-	log.Println("Nashville Data Ingester started")
+	log.Printf("%s Data Ingester started", cfg.City)
+
+	// Start per-source goroutines
+	var wg sync.WaitGroup
+	for name, src := range cfg.Sources {
+		wg.Add(1)
+		go func(name string, src Source) {
+			defer wg.Done()
+			runSourceIngester(ctx, name, src)
+		}(name, src)
+	}
+
+	wg.Wait()
+	log.Println("Shutting down")
+}
+
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// ============== Source Ingester ==============
+
+func runSourceIngester(ctx context.Context, name string, src Source) {
+	interval, err := time.ParseDuration(src.Interval)
+	if err != nil {
+		log.Printf("[%s] Invalid interval %q, using 10m", name, src.Interval)
+		interval = 10 * time.Minute
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Printf("[%s] Starting ingester (interval: %s)", name, interval)
 
 	// Fetch immediately on startup
-	fetchAll(ctx)
-
-	// Poll every 10 minutes
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
+	fetchAndStore(ctx, name, src)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Shutting down")
+			log.Printf("[%s] Stopping", name)
 			return
 		case <-ticker.C:
-			fetchAll(ctx)
+			fetchAndStore(ctx, name, src)
 		}
 	}
 }
 
-// ============== Fetch Orchestration ==============
-
-func fetchAll(ctx context.Context) {
-	var wg sync.WaitGroup
-	wg.Add(3)
-
-	go func() {
-		defer wg.Done()
-		fetchAccidents(ctx)
-	}()
-
-	go func() {
-		defer wg.Done()
-		fetchDispatch(ctx)
-	}()
-
-	go func() {
-		defer wg.Done()
-		fetchFire(ctx)
-	}()
-
-	wg.Wait()
-	log.Println("All data sources fetched")
-}
-
-// ============== Accidents ==============
-
-func fetchAccidents(ctx context.Context) {
-	const url = "https://services2.arcgis.com/HdTo6HJqh92wn4D8/arcgis/rest/services/Traffic_Accidents_2/FeatureServer/0/query"
-
-	var result AccidentsResponse
+func fetchAndStore(ctx context.Context, name string, src Source) {
+	// Fetch data from API
 	resp, err := client.R().
-		SetQueryParams(map[string]string{
-			"where":             "1=1",
-			"outFields":         "*",
-			"outSR":             "4326",
-			"f":                 "json",
-			"resultRecordCount": "100",
-			"orderByFields":     "Date_and_Time DESC",
-		}).
-		SetResult(&result).
-		Get(url)
+		SetQueryParams(src.Params).
+		Get(src.URL)
 
 	if err != nil {
-		log.Printf("[Accidents] Fetch error: %v", err)
+		log.Printf("[%s] Fetch error: %v", name, err)
 		return
 	}
 	if resp.StatusCode() != 200 {
-		log.Printf("[Accidents] Bad status: %d", resp.StatusCode())
+		log.Printf("[%s] Bad status: %d", name, resp.StatusCode())
 		return
 	}
 
-	if len(result.Features) == 0 {
-		log.Println("[Accidents] No records fetched")
-		return
-	}
-
-	log.Printf("[Accidents] Fetched %d records", len(result.Features))
-
-	// Batch insert
-	batch := &pgx.Batch{}
-	const query = `INSERT INTO accidents (accident_number, date_time, geom, latitude, longitude, collision_type, weather_condition)
-		VALUES ($1, $2, ST_SetSRID(ST_MakePoint($4, $3), 4326), $3, $4, $5, $6)
-		ON CONFLICT (accident_number) DO NOTHING`
-
-	for _, f := range result.Features {
-		batch.Queue(query,
-			fmt.Sprintf("%.0f", f.Attributes.AccidentNumber),
-			time.UnixMilli(f.Attributes.DateTime),
-			f.Geometry.Y,
-			f.Geometry.X,
-			f.Attributes.CollisionType,
-			f.Attributes.WeatherCondition,
-		)
-	}
-
-	inserted := executeBatch(ctx, batch, "[Accidents]")
-	log.Printf("[Accidents] Inserted %d new records", inserted)
-}
-
-// ============== Dispatch ==============
-
-func fetchDispatch(ctx context.Context) {
-	const url = "https://services2.arcgis.com/HdTo6HJqh92wn4D8/arcgis/rest/services/Metro_Nashville_Police_Department_Active_Dispatch_Table_view/FeatureServer/0/query"
-
-	var result DispatchResponse
-	resp, err := client.R().
-		SetQueryParams(map[string]string{
-			"where":     "1=1",
-			"outFields": "*",
-			"outSR":     "4326",
-			"f":         "json",
-		}).
-		SetResult(&result).
-		Get(url)
-
+	// Parse based on source type
+	parser := getParser(name, src.Type)
+	events, err := parser.Parse(resp.Body())
 	if err != nil {
-		log.Printf("[Dispatch] Fetch error: %v", err)
-		return
-	}
-	if resp.StatusCode() != 200 {
-		log.Printf("[Dispatch] Bad status: %d", resp.StatusCode())
+		log.Printf("[%s] Parse error: %v", name, err)
 		return
 	}
 
-	if len(result.Features) == 0 {
-		log.Println("[Dispatch] No records fetched")
+	if len(events) == 0 {
+		log.Printf("[%s] No events fetched", name)
 		return
 	}
 
-	log.Printf("[Dispatch] Fetched %d records", len(result.Features))
+	log.Printf("[%s] Fetched %d events", name, len(events))
 
-	// Batch upsert
+	// Batch insert into events table
+	inserted := batchInsertEvents(ctx, events, name)
+	log.Printf("[%s] Upserted %d events", name, inserted)
+}
+
+func getParser(name, sourceType string) sources.Parser {
+	switch sourceType {
+	case "arcgis":
+		// Map config name to source type for the parser
+		eventType := name
+		switch name {
+		case "accidents":
+			eventType = "accident"
+		case "police_dispatch":
+			eventType = "police_dispatch"
+		case "fire_incidents":
+			eventType = "fire_incident"
+		}
+		return sources.NewArcGISParser(eventType)
+	case "weather":
+		return sources.NewWeatherParser()
+	default:
+		log.Printf("[%s] Unknown source type %q, using ArcGIS", name, sourceType)
+		return sources.NewArcGISParser(name)
+	}
+}
+
+func batchInsertEvents(ctx context.Context, events []sources.Event, tag string) int64 {
 	batch := &pgx.Batch{}
-	const query = `INSERT INTO dispatch (object_id, incident_type_code, incident_type_name, call_received_time, location, location_description, city_name, last_updated)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (object_id) DO UPDATE SET
-			incident_type_code = EXCLUDED.incident_type_code,
-			incident_type_name = EXCLUDED.incident_type_name,
-			call_received_time = EXCLUDED.call_received_time,
-			location = EXCLUDED.location,
-			location_description = EXCLUDED.location_description,
-			city_name = EXCLUDED.city_name,
-			last_updated = EXCLUDED.last_updated`
 
-	for _, f := range result.Features {
+	const query = `
+		INSERT INTO events (source_type, external_id, event_time, geom, lat, lon, category, description, payload)
+		VALUES ($1, $2, $3,
+			CASE WHEN $4::float IS NOT NULL AND $5::float IS NOT NULL
+				THEN ST_SetSRID(ST_MakePoint($5, $4), 4326)
+				ELSE NULL
+			END,
+			$4, $5, $6, $7, $8)
+		ON CONFLICT (source_type, external_id) DO UPDATE SET
+			event_time = EXCLUDED.event_time,
+			geom = EXCLUDED.geom,
+			lat = EXCLUDED.lat,
+			lon = EXCLUDED.lon,
+			category = EXCLUDED.category,
+			description = EXCLUDED.description,
+			payload = EXCLUDED.payload`
+
+	for _, e := range events {
 		batch.Queue(query,
-			f.Attributes.ObjectId,
-			f.Attributes.IncidentTypeCode,
-			f.Attributes.IncidentTypeName,
-			epochToTime(f.Attributes.CallReceivedTime),
-			f.Attributes.Location,
-			f.Attributes.LocationDescription,
-			f.Attributes.CityName,
-			epochToTime(f.Attributes.LastUpdated),
+			e.SourceType,
+			e.ExternalID,
+			e.EventTime,
+			e.Lat,
+			e.Lon,
+			e.Category,
+			e.Description,
+			e.Payload,
 		)
 	}
 
-	upserted := executeBatch(ctx, batch, "[Dispatch]")
-	log.Printf("[Dispatch] Upserted %d records", upserted)
-}
-
-// ============== Fire ==============
-
-func fetchFire(ctx context.Context) {
-	const url = "https://services2.arcgis.com/HdTo6HJqh92wn4D8/arcgis/rest/services/Nashville_Fire_Department_Active_Incidents_view/FeatureServer/0/query"
-
-	var result FireResponse
-	resp, err := client.R().
-		SetQueryParams(map[string]string{
-			"where":     "1=1",
-			"outFields": "*",
-			"outSR":     "4326",
-			"f":         "json",
-		}).
-		SetResult(&result).
-		Get(url)
-
-	if err != nil {
-		log.Printf("[Fire] Fetch error: %v", err)
-		return
-	}
-	if resp.StatusCode() != 200 {
-		log.Printf("[Fire] Bad status: %d", resp.StatusCode())
-		return
-	}
-
-	if len(result.Features) == 0 {
-		log.Println("[Fire] No records fetched")
-		return
-	}
-
-	log.Printf("[Fire] Fetched %d records", len(result.Features))
-
-	// Batch upsert
-	batch := &pgx.Batch{}
-	const query = `INSERT INTO fire_incidents (object_id, event_number, unit_id, incident_type_id, dispatch_time, postal_code)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (object_id) DO UPDATE SET
-			event_number = EXCLUDED.event_number,
-			unit_id = EXCLUDED.unit_id,
-			incident_type_id = EXCLUDED.incident_type_id,
-			dispatch_time = EXCLUDED.dispatch_time,
-			postal_code = EXCLUDED.postal_code`
-
-	for _, f := range result.Features {
-		batch.Queue(query,
-			f.Attributes.ObjectId,
-			f.Attributes.EventNumber,
-			f.Attributes.UnitID,
-			f.Attributes.IncidentTypeID,
-			epochToTime(f.Attributes.DispatchDateTime),
-			f.Attributes.PostalCode,
-		)
-	}
-
-	upserted := executeBatch(ctx, batch, "[Fire]")
-	log.Printf("[Fire] Upserted %d records", upserted)
-}
-
-// ============== Helpers ==============
-
-// epochToTime converts millisecond epoch to *time.Time (nil-safe)
-func epochToTime(epoch *int64) *time.Time {
-	if epoch == nil {
-		return nil
-	}
-	t := time.UnixMilli(*epoch)
-	return &t
-}
-
-// executeBatch sends a batch to the database and returns rows affected
-func executeBatch(ctx context.Context, batch *pgx.Batch, tag string) int64 {
 	results := dbPool.SendBatch(ctx, batch)
 	defer results.Close()
 
@@ -351,7 +240,7 @@ func executeBatch(ctx context.Context, batch *pgx.Batch, tag string) int64 {
 	for i := 0; i < batch.Len(); i++ {
 		ct, err := results.Exec()
 		if err != nil {
-			log.Printf("%s Batch exec error at index %d: %v", tag, i, err)
+			log.Printf("[%s] Batch exec error at index %d: %v", tag, i, err)
 			continue
 		}
 		totalAffected += ct.RowsAffected()

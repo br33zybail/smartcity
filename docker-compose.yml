@@ -8,6 +8,9 @@ services:
       - .env
     environment:
       DATABASE_URL: postgres://postgres:devpassword@db:5432/smartcity
+      CONFIG_PATH: /app/config/nashville.yaml
+    volumes:
+      - ./config/cities/nashville.yaml:/app/config/nashville.yaml:ro
     depends_on:
       db:
         condition: service_healthy

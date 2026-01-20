@@ -1,0 +1,50 @@
+city: nashville
+timezone: America/Chicago
+bbox:
+  min_lat: 36.08
+  min_lon: -87.0
+  max_lat: 36.30
+  max_lon: -86.5
+
+sources:
+  accidents:
+    url: "https://services2.arcgis.com/HdTo6HJqh92wn4D8/arcgis/rest/services/Traffic_Accidents_2/FeatureServer/0/query"
+    type: arcgis
+    interval: 10m
+    params:
+      where: "1=1"
+      outFields: "*"
+      outSR: "4326"
+      f: json
+      resultRecordCount: "100"
+      orderByFields: "Date_and_Time DESC"
+
+  police_dispatch:
+    url: "https://services2.arcgis.com/HdTo6HJqh92wn4D8/arcgis/rest/services/Metro_Nashville_Police_Department_Active_Dispatch_Table_view/FeatureServer/0/query"
+    type: arcgis
+    interval: 2m
+    params:
+      where: "1=1"
+      outFields: "*"
+      outSR: "4326"
+      f: json
+
+  fire_incidents:
+    url: "https://services2.arcgis.com/HdTo6HJqh92wn4D8/arcgis/rest/services/Nashville_Fire_Department_Active_Incidents_view/FeatureServer/0/query"
+    type: arcgis
+    interval: 2m
+    params:
+      where: "1=1"
+      outFields: "*"
+      outSR: "4326"
+      f: json
+
+  weather:
+    url: "https://api.open-meteo.com/v1/forecast"
+    type: weather
+    interval: 15m
+    params:
+      latitude: "36.1627"
+      longitude: "-86.7816"
+      current: "temperature_2m,precipitation,weather_code,wind_speed_10m"
+      timezone: "America/Chicago"
